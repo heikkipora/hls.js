@@ -1,10 +1,15 @@
 import { utf8ArrayToStr } from '@svta/common-media-library/utils/utf8ArrayToStr';
 import { arrayToHex } from './hex';
 import { ElementaryStreamTypes } from '../loader/fragment';
+import { MetadataSchema } from '../types/demuxer';
 import { logger } from '../utils/logger';
 import type { KeySystemIds } from './mediakeys-helper';
 import type { DecryptData } from '../loader/level-key';
-import type { PassthroughTrack, UserdataSample } from '../types/demuxer';
+import type {
+  MetadataSample,
+  PassthroughTrack,
+  UserdataSample,
+} from '../types/demuxer';
 import type { ILogger } from '../utils/logger';
 
 type BoxDataOrUndefined = Uint8Array<ArrayBuffer> | undefined;
@@ -1049,6 +1054,150 @@ export function isHEVC(codec: string | undefined) {
     baseCodec === 'dvh1' ||
     baseCodec === 'dvhe'
   );
+}
+
+/**
+ * Parse metadata samples from MP4 data tracks (timed metadata tracks)
+ * @param data - MP4 fragment data containing moof+mdat boxes
+ * @param initData - Parsed init segment data with track information
+ * @param metaTrackId - Track ID of the metadata track
+ * @param timeOffset - Time offset to apply to sample timestamps
+ * @returns Array of metadata samples
+ */
+export function parseDataTrackSamples(
+  data: Uint8Array,
+  initData: InitData,
+  metaTrackId: number,
+  timeOffset: number,
+): MetadataSample[] {
+  const samples: MetadataSample[] = [];
+  const track = initData[metaTrackId];
+
+  if (!track?.type || track.type !== 'meta') {
+    return samples;
+  }
+
+  const timescale = track.timescale;
+  const moofs = findBox(data, ['moof']);
+
+  moofs.forEach((moof) => {
+    const moofOffset = moof.byteOffset - 8;
+    const trafs = findBox(moof, ['traf']);
+
+    trafs.forEach((traf) => {
+      // Get track ID from tfhd
+      const tfhd = findBox(traf, ['tfhd'])[0];
+      if (!tfhd) {
+        return;
+      }
+      const id = readUint32(tfhd, 4);
+
+      if (id !== metaTrackId) {
+        return; // Skip non-metadata tracks
+      }
+
+      // Get base decode time from tfdt
+      const tfdt = findBox(traf, ['tfdt'])[0];
+      let baseTime = 0;
+      if (tfdt) {
+        const version = tfdt[0];
+        baseTime = readUint32(tfdt, 4);
+        if (version === 1) {
+          baseTime *= Math.pow(2, 32);
+          baseTime += readUint32(tfdt, 8);
+        }
+      }
+
+      // Parse tfhd for default sample duration
+      const tfhdFlags = readUint32(tfhd, 0) & 0xffffff;
+      const trackDefault = track.default;
+      let defaultSampleDuration: number = trackDefault?.duration || 0;
+
+      if (tfhdFlags & 0x000008) {
+        // 0x000008 indicates the presence of the default_sample_duration field
+        if (tfhdFlags & 0x000002) {
+          // 0x000002 indicates the presence of the sample_description_index field
+          defaultSampleDuration = readUint32(tfhd, 12);
+        } else {
+          defaultSampleDuration = readUint32(tfhd, 8);
+        }
+      }
+
+      // Parse trun to get sample information
+      const truns = findBox(traf, ['trun']);
+      truns.forEach((trun) => {
+        const flags = readUint32(trun, 0) & 0xffffff;
+        const sampleCount = readUint32(trun, 4);
+
+        const dataOffsetPresent = (flags & 0x000001) !== 0;
+        const sampleDurationPresent = (flags & 0x000100) !== 0;
+        const sampleSizePresent = (flags & 0x000200) !== 0;
+
+        let offset = 8;
+        let dataOffset = 0;
+
+        if (dataOffsetPresent) {
+          dataOffset = readSint32(trun, offset);
+          offset += 4;
+        }
+
+        // Skip first sample flags if present
+        if (flags & 0x000004) {
+          offset += 4;
+        }
+
+        let sampleTime = baseTime / timescale + timeOffset;
+        let sampleDataOffset = moofOffset + dataOffset;
+
+        for (let i = 0; i < sampleCount; i++) {
+          let sampleDuration = defaultSampleDuration;
+          let sampleSize = 0;
+
+          if (sampleDurationPresent) {
+            sampleDuration = readUint32(trun, offset);
+            offset += 4;
+          }
+
+          if (sampleSizePresent) {
+            sampleSize = readUint32(trun, offset);
+            offset += 4;
+          }
+
+          // Skip sample flags if present
+          if (flags & 0x000400) {
+            offset += 4;
+          }
+
+          // Skip composition time offset if present
+          if (flags & 0x000800) {
+            offset += 4;
+          }
+
+          // Extract sample data from mdat
+          if (sampleSize > 0) {
+            const sampleData = data.subarray(
+              sampleDataOffset,
+              sampleDataOffset + sampleSize,
+            );
+
+            samples.push({
+              pts: sampleTime,
+              dts: sampleTime,
+              duration: sampleDuration / timescale,
+              len: sampleSize,
+              data: sampleData,
+              type: MetadataSchema.misbklv,
+            });
+          }
+
+          sampleTime += sampleDuration / timescale;
+          sampleDataOffset += sampleSize;
+        }
+      });
+    });
+  });
+
+  return samples;
 }
 
 function isSEIMessage(isHEVCFlavor: boolean, naluHeader: number) {

@@ -202,6 +202,12 @@ class ID3TrackController implements ComponentAPI {
 
     for (let i = 0; i < samples.length; i++) {
       const type = samples[i].type;
+
+      // Skip data track metadata samples - they're only delivered via FRAG_PARSING_METADATA event
+      if (type === MetadataSchema.misbklv) {
+        continue;
+      }
+
       if (
         (type === MetadataSchema.emsg && !enableEmsgMetadataCues) ||
         !enableID3MetadataCues

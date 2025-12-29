@@ -16,6 +16,7 @@ import {
   appendUint8Array,
   findBox,
   hasMoofData,
+  parseDataTrackSamples,
   parseEmsg,
   parseInitSegment,
   parseSamples,
@@ -36,6 +37,8 @@ class MP4Demuxer implements Demuxer {
   private audioTrack?: DemuxedAudioTrack;
   private id3Track?: DemuxedMetadataTrack;
   private txtTrack?: DemuxedUserdataTrack;
+  private initSegment?: Uint8Array;
+  private metaTrackId?: number;
 
   constructor(observer: HlsEventEmitter, config: HlsConfig) {
     this.config = config;
@@ -68,6 +71,10 @@ class MP4Demuxer implements Demuxer {
     if (!initSegment?.byteLength) {
       return;
     }
+
+    // Store init segment for data track parsing
+    this.initSegment = initSegment;
+
     const initData = parseInitSegment(initSegment);
 
     if (initData.video) {
@@ -88,6 +95,27 @@ class MP4Demuxer implements Demuxer {
     captionTrack.id = RemuxerTrackIdConfig.text;
     videoTrack.sampleDuration = 0;
     videoTrack.duration = audioTrack.duration = trackDuration;
+
+    // Detect metadata track if enabled
+    if (this.config.enableDataTrackMetadata) {
+      this.metaTrackId = this.findMetadataTrack(initData);
+    }
+  }
+
+  private findMetadataTrack(initData: any): number | undefined {
+    // If track ID is explicitly configured, use it
+    if (this.config.dataTrackMetadataTrackId !== undefined) {
+      return this.config.dataTrackMetadataTrackId;
+    }
+
+    // Auto-detect: find first 'meta' track
+    for (let i = 0; i < initData.length; i++) {
+      const track = initData[i];
+      if (track?.type === 'meta') {
+        return i;
+      }
+    }
+    return undefined;
   }
 
   public resetContiguity(): void {
@@ -121,6 +149,24 @@ class MP4Demuxer implements Demuxer {
       videoTrack.samples = videoSamples;
     }
     const id3Track = this.extractID3Track(videoTrack, timeOffset);
+
+    // Extract metadata from data tracks if enabled
+    if (
+      this.config.enableDataTrackMetadata &&
+      this.metaTrackId !== undefined &&
+      this.initSegment
+    ) {
+      const initData = parseInitSegment(this.initSegment);
+      const dataTrackSamples = parseDataTrackSamples(
+        videoTrack.samples,
+        initData,
+        this.metaTrackId,
+        timeOffset,
+      );
+      // Merge with existing id3Track samples
+      id3Track.samples.push(...dataTrackSamples);
+    }
+
     textTrack.samples = parseSamples(timeOffset, videoTrack);
 
     return {
@@ -139,6 +185,25 @@ class MP4Demuxer implements Demuxer {
     this.remainderData = null;
 
     const id3Track = this.extractID3Track(videoTrack, this.timeOffset);
+
+    // Extract metadata from data tracks if enabled
+    if (
+      this.config.enableDataTrackMetadata &&
+      this.metaTrackId !== undefined &&
+      this.initSegment &&
+      videoTrack.samples.length
+    ) {
+      const initData = parseInitSegment(this.initSegment);
+      const dataTrackSamples = parseDataTrackSamples(
+        videoTrack.samples,
+        initData,
+        this.metaTrackId,
+        timeOffset,
+      );
+      // Merge with existing id3Track samples
+      id3Track.samples.push(...dataTrackSamples);
+    }
+
     textTrack.samples = parseSamples(timeOffset, videoTrack);
 
     return {
